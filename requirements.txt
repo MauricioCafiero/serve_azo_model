@@ -7,6 +7,7 @@ torch>=2.0
 scikit-fingerprints>=1.6.0     # provides skfp.fingerprints.MordredFingerprint
 mordredcommunity>=2.0.0        # Mordred descriptor backend used by skfp
 rdkit>=2023.3
+Pillow>=10.0                    # molecule grid PNG assembly in the worker
 numpy>=1.24
 pandas>=2.0
 scikit-learn>=1.3              # only used for R2 in the optional comparison view

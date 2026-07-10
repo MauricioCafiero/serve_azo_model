@@ -24,39 +24,93 @@ import streamlit as st
 st.set_page_config(page_title="AZO lambda_max predictor", page_icon="🧪",
                    layout="centered")
 
-# Prediction and rendering run in a fresh subprocess (azo_worker.py), not in
-# this process and not via multiprocessing -- so the RDKit/Mordred C++ engine
-# is never loaded here and a segfault there can't take the Streamlit server
-# down. The parent only needs the path to the artifacts and the worker script.
+# Prediction and rendering run in a PERSISTENT subprocess (azo_worker.py)
+# started once at import -- NOT a fresh subprocess per Predict click. The
+# RDKit/Mordred C++ engine is never loaded in this process, so a segfault in
+# the worker can't take the Streamlit server down; and because we fork the
+# Streamlit parent exactly once (at import, before heavy numpy use here)
+# instead of on every click, the repeated-fork crash that killed the server
+# on the second run is gone. If the worker dies, we kill and restart it.
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 _WORKER = os.path.join(_MODEL_DIR, "azo_worker.py")
 
+import json
+import queue
+import subprocess
+import sys
+import threading
+
+_WORKER_LOCK = threading.Lock()
+_WORKER_PROC = None
+
+
+def _kill_worker():
+    global _WORKER_PROC
+    if _WORKER_PROC is not None:
+        try:
+            _WORKER_PROC.kill()
+        except Exception:
+            pass
+        try:
+            _WORKER_PROC.wait(timeout=5)
+        except Exception:
+            pass
+        _WORKER_PROC = None
+
+
+def _ensure_worker():
+    """Return a live worker process, starting one if none exists."""
+    global _WORKER_PROC
+    if _WORKER_PROC is not None and _WORKER_PROC.poll() is None:
+        return _WORKER_PROC
+    _WORKER_PROC = subprocess.Popen(
+        [sys.executable, _WORKER],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        cwd=_MODEL_DIR, text=True, bufsize=1)
+    return _WORKER_PROC
+
 
 def _call_worker(payload, timeout):
-    """Run azo_worker.py with a JSON request, return its JSON response.
-    Raises RuntimeError on crash/timeout so callers can fall back gracefully."""
-    import json
-    import subprocess
-    import sys
-    try:
-        proc = subprocess.run(
-            [sys.executable, _WORKER],
-            input=json.dumps(payload), capture_output=True, text=True,
-            cwd=_MODEL_DIR, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("timed out")
-    if proc.returncode != 0:
-        raise RuntimeError(f"crashed (exit {proc.returncode})")
-    try:
-        return json.loads(proc.stdout)
-    except Exception:
-        raise RuntimeError("no output")
+    """Send one JSON request to the persistent worker, read one JSON response.
+    Raises RuntimeError on timeout or worker death so callers fall back; on
+    either, the worker is killed and the next call starts a fresh one."""
+    req = json.dumps(payload) + "\n"
+    with _WORKER_LOCK:
+        proc = _ensure_worker()
+        try:
+            proc.stdin.write(req)
+            proc.stdin.flush()
+        except Exception:
+            _kill_worker()
+            proc = _ensure_worker()
+            proc.stdin.write(req)
+            proc.stdin.flush()
+        # Read one response line with a timeout (proc.stdout.readline blocks,
+        # so run it in a daemon thread and get from a queue).
+        resp_q = queue.Queue()
+
+        def _reader():
+            try:
+                resp_q.put(proc.stdout.readline())
+            except Exception:
+                resp_q.put("")
+
+        threading.Thread(target=_reader, daemon=True).start()
+        try:
+            line = resp_q.get(timeout=timeout)
+        except queue.Empty:
+            _kill_worker()  # worker likely hung -> resync by restarting
+            raise RuntimeError("timed out")
+        if not line:
+            _kill_worker()  # worker died (segfault) -> restart on next call
+            raise RuntimeError("worker died")
+        return json.loads(line)
 
 
 def predict_safe(model_dir, smiles_list, timeout=240.0, per_item_timeout=60.0):
-    """Predict lambda_max via a subprocess worker. On a whole-batch crash,
-    fall back to one worker per SMILES so a single bad input is reported
-    invalid instead of costing the batch."""
+    """Predict lambda_max via the persistent worker. On a batch-level crash,
+    fall back to one request per SMILES so a single bad input is reported
+    invalid instead of costing the whole batch."""
     if isinstance(smiles_list, str):
         smiles_list = [smiles_list]
     try:
@@ -76,14 +130,14 @@ def predict_safe(model_dir, smiles_list, timeout=240.0, per_item_timeout=60.0):
         return preds, invalid
 
 
-def render_smiles_svg(items, timeout=120.0):
-    """Render molecules to one SVG string via a subprocess worker. Returns ''
-    on crash/timeout/parse-failure so the UI shows a graceful fallback."""
+def render_smiles_png(items, timeout=120.0):
+    """Render molecules to a single PNG (base64) via the persistent worker.
+    Returns '' on crash/timeout/parse-failure so the UI shows a fallback."""
     if not items:
         return ""
     try:
         r = _call_worker({"mode": "render", "items": items}, timeout)
-        return r.get("svg", "")
+        return r.get("png", "")
     except RuntimeError:
         return ""
 
@@ -97,7 +151,7 @@ st.caption(
 
 # Build marker -- bump with every deploy so the live page shows which code is
 # running.
-_BUILD = "build-10 (subprocess isolation, no multiprocessing, 2026-07-10)"
+_BUILD = "build-11 (persistent worker, per-mol PNG render, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
@@ -175,17 +229,16 @@ if st.button("Predict", type="primary", width="stretch"):
             c1.metric("MAE (nm)", f"{mae:.2f}")
             c2.metric("R²", f"{r2:.3f}")
 
-        # Draw the molecules. Rendering also runs in a spawned child (see
-        # render_smiles_svg): RDKit's 2D drawer is C++ and can segfault on
-        # certain inputs/builds, and that must not take this server down. The
-        # parent never imports or calls RDKit -- it just displays the SVG.
+        # Draw the molecules. Rendering runs in the persistent worker (see
+        # render_smiles_png): each molecule is drawn in its own fresh drawer
+        # and composited onto an explicit white grid, so there is no shared-
+        # drawer black-panel bug and the background can't be black. The parent
+        # never imports RDKit -- it just decodes the PNG and displays it.
         smi_leg = [(batch[i], f"{pred[i]:.0f} nm") for i in valid_idx]
-        svg = render_smiles_svg(smi_leg)
+        png_b64 = render_smiles_png(smi_leg)
         st.subheader("Structures")
-        if svg:
-            # st.image renders an SVG string as a data-URI <img> (it matches
-            # the leading <?xml?>/<svg> and base64-encodes it). width="stretch"
-            # is the recommended sizing for SVGs.
-            st.image(svg, width="stretch")
+        if png_b64:
+            import base64
+            st.image(base64.b64decode(png_b64), width="stretch")
         else:
             st.info("(Molecule rendering unavailable for this batch.)")
