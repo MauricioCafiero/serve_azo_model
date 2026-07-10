@@ -36,7 +36,7 @@ st.markdown(
 )
 
 # ---- input -------------------------------------------------------------- #
-example = "CN(N=C1C)C(C)=C1/N=N/C2=C(OC)C=CC=C2OC1"
+example = "CN(N=C1C)C(C)=C1/N=N/C2=C(OC)C=CC=C2OC"
 smiles_in = st.text_area(
     "Enter SMILES (one per line; blank lines are ignored):",
     value=example, height=120, help="Canonical or non-canonical SMILES are fine.",
@@ -54,8 +54,17 @@ if st.button("Predict", type="primary", use_container_width=True):
     if not batch:
         st.warning("Enter at least one SMILES.")
     else:
-        with st.spinner("Featurizing with Mordred and running the MLP…"):
-            pred, invalid = get_predictor().predict(batch)
+        try:
+            with st.spinner("Featurizing with Mordred and running the MLP…"):
+                pred, invalid = get_predictor().predict(batch)
+        except Exception as e:  # never let a bad batch kill the whole app
+            st.error(
+                "Something went wrong while processing this batch. Check your "
+                "SMILES for typos and try again."
+            )
+            with st.expander("Error details"):
+                st.code(f"{type(e).__name__}: {e}")
+            st.stop()
         invalid_set = set(invalid)
 
         if invalid_set:
@@ -93,17 +102,27 @@ if st.button("Predict", type="primary", use_container_width=True):
             c1.metric("MAE (nm)", f"{mae:.2f}")
             c2.metric("R²", f"{r2:.3f}")
 
-        # Draw the molecules (lightweight RDKit rendering, no 3D needed)
+        # Draw the molecules (lightweight RDKit rendering, no 3D needed).
+        # Use the SVG drawer rather than Draw.MolsToGridImage: the PNG/cairo
+        # path pulls in libXrender (libXrender.so.1), which is missing on
+        # Streamlit Cloud, so images silently fail there. MolDraw2DSVG is
+        # pure-Python and renders identically.
         try:
             from rdkit import Chem
-            from rdkit.Chem import Draw
+            from rdkit.Chem.Draw import rdMolDraw2D
             good = [(i, batch[i]) for i in valid_idx]
             if good:
                 mols = [Chem.MolFromSmiles(s) for _, s in good]
                 leg = [f"{pred[i]:.0f} nm" for i, _ in good]
-                img = Draw.MolsToGridImage(mols, molsPerRow=4,
-                                           subImgSize=(260, 200), legends=leg)
+                ncol, sub = 4, (260, 200)
+                nrow = (len(mols) + ncol - 1) // ncol
+                drawer = rdMolDraw2D.MolDraw2DSVG(ncol * sub[0], nrow * sub[1],
+                                                 sub[0], sub[1])
+                drawer.DrawMolecules(mols, legends=leg)
+                drawer.FinishDrawing()
+                svg = drawer.GetDrawingText()
+                svg = svg[svg.find("<svg"):]  # drop <?xml?> prolog
                 st.subheader("Structures")
-                st.image(img)
+                st.markdown(svg, unsafe_allow_html=True)
         except Exception as e:  # rendering is cosmetic; never block on it
             st.info(f"(Molecule rendering unavailable: {e})")

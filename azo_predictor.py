@@ -126,35 +126,75 @@ class Featurizer:
         from skfp.fingerprints import MordredFingerprint
         self._mordred = MordredFingerprint(use_3D=False, n_jobs=n_jobs)
 
+    def _transform_safe(self, mols):
+        """Featurize molecules one at a time, isolating failures.
+
+        Mordred can raise on a single pathological-but-parseable molecule, and
+        because it processes the whole batch at once one bad input would
+        otherwise take the entire batch down. This fallback computes each
+        molecule independently and returns a descriptor array aligned 1:1 with
+        `mols` (an all-NaN row for any that crashed) plus the set of positions
+        that crashed, so they can be reported as invalid rather than aborting.
+        """
+        rows, crashed = [], set()
+        n_cols = None
+        for i, m in enumerate(mols):
+            try:
+                r = np.asarray(self._mordred.transform([m]), dtype=np.float64)
+                if n_cols is None:
+                    n_cols = r.shape[1]
+                rows.append(r[0])
+            except Exception:
+                crashed.add(i)
+        if n_cols is None:  # every molecule crashed
+            return np.full((len(mols), 0), np.nan, dtype=np.float64), crashed
+        Xv = np.full((len(mols), n_cols), np.nan, dtype=np.float64)
+        kept = [i for i in range(len(mols)) if i not in crashed]
+        Xv[kept] = np.vstack(rows)
+        return Xv, crashed
+
     def transform(self, smiles_list: Union[str, List[str]]):
         """Return (X, invalid_idx).
 
         X: float64 array shape (n_smiles, 1613) with all-NaN rows for inputs that
-        failed to parse. invalid_idx: list of positions whose SMILES did not
-        parse.
+        failed to parse (or that crashed Mordred). invalid_idx: list of
+        positions whose SMILES did not parse or could not be featurized.
         """
         from rdkit import Chem
         if isinstance(smiles_list, str):
             smiles_list = [smiles_list]
         cleaned = _clean_smiles(smiles_list)
 
-        mols, invalid_idx = [], []
+        # Parse each SMILES; keep positions and mol objects for the valid ones.
+        valid_pos, valid_mols, invalid_idx = [], [], []
         for i, smi in enumerate(cleaned):
             m = Chem.MolFromSmiles(smi)
             if m is None:
                 invalid_idx.append(i)
             else:
-                mols.append(m)
+                valid_pos.append(i)
+                valid_mols.append(m)
 
-        n_cols = None
-        X = np.full((len(cleaned), 1 if not mols else 0), np.nan, dtype=np.float64)
-        if mols:
-            Xv = np.asarray(self._mordred.transform(mols), dtype=np.float64)
-            n_cols = Xv.shape[1]
-            X = np.full((len(cleaned), n_cols), np.nan, dtype=np.float64)
-            # Re-insert valid rows at their original positions.
-            valid_pos = [i for i in range(len(cleaned)) if i not in set(invalid_idx)]
-            X[valid_pos] = Xv
+        X = np.full((len(cleaned), 1), np.nan, dtype=np.float64)
+        if valid_mols:
+            try:
+                Xv = np.asarray(self._mordred.transform(valid_mols),
+                                dtype=np.float64)
+            except Exception:
+                # A pathological molecule made Mordred throw on the whole batch;
+                # fall back to per-molecule featurization so one bad input
+                # doesn't kill the rest. Xv is 1:1 with valid_mols (NaN rows for
+                # the crashed ones), so a single keep-filter aligns it with the
+                # surviving valid_pos.
+                Xv, crashed = self._transform_safe(valid_mols)
+                for k in crashed:
+                    invalid_idx.append(valid_pos[k])
+                keep = [k for k in range(len(valid_mols)) if k not in crashed]
+                valid_pos = [valid_pos[k] for k in keep]
+                Xv = Xv[keep]
+            if Xv.size:
+                X = np.full((len(cleaned), Xv.shape[1]), np.nan, dtype=np.float64)
+                X[valid_pos] = Xv
         return X, invalid_idx
 
 
