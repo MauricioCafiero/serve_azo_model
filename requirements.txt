@@ -1,0 +1,12 @@
+# Streamlit AZO lambda_max predictor -- minimal runtime deps.
+# Versions are NOT pinned here; the pinned full-environment freeze lives in the
+# parent repo's requirements.txt. For exact reproducibility recreate the parent
+# ml-env and `pip install streamlit` into it (see README.md).
+streamlit>=1.30
+torch>=2.0
+scikit-fingerprints>=1.6.0     # provides skfp.fingerprints.MordredFingerprint
+mordredcommunity>=2.0.0        # Mordred descriptor backend used by skfp
+rdkit>=2023.3
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3              # only used for R2 in the optional comparison view
