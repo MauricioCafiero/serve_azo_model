@@ -9,6 +9,15 @@ holdout). Run with:
 """
 import os
 
+# Force the numeric backends to a single thread BEFORE numpy/torch are
+# imported. spawn() (like fork()) still calls fork() in this parent process;
+# if MKL/OpenMP has a multi-threaded pool here, that fork is unsafe and a
+# child that segfaults can take this server down with it. One thread => no
+# pool to corrupt. Must run before `import numpy`.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ[_v] = "1"
+
 import numpy as np
 import streamlit as st
 
@@ -31,9 +40,9 @@ st.caption(
     "performance on 18 new azo dyes: **MAE ≈ 27 nm, R² ≈ 0.69**."
 )
 
-# Build marker -- bump this string with every deploy so you can confirm (from
-# the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-8 (predict + render both spawn-isolated, 2026-07-10)"
+# Build marker -- bump with every deploy so the live page shows which code is
+# running.
+_BUILD = "build-9 (single-thread env forced before numpy import, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
