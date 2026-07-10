@@ -7,18 +7,21 @@ holdout). Run with:
 
     streamlit run app.py
 """
+import os
+
 import numpy as np
 import streamlit as st
 
-from azo_predictor import AZOPredictor
+from azo_predictor import predict_safe
 
 st.set_page_config(page_title="AZO lambda_max predictor", page_icon="🧪",
                    layout="centered")
 
-# Cached so the model + Mordred featurizer load once per session.
-@st.cache_resource
-def get_predictor():
-    return AZOPredictor()
+# The model + Mordred featurizer load in the spawned prediction child, not
+# here -- the parent (this Streamlit process) never touches the C++ engine, so
+# a segfault in a child can't take the server down. We only need the path to
+# the artifacts.
+_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 st.title("AZO dye λmax predictor")
@@ -30,7 +33,7 @@ st.caption(
 
 # Build marker -- bump this string with every deploy so you can confirm (from
 # the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-6 (segfault-isolated predict, 2026-07-10)"
+_BUILD = "build-7 (spawn-isolated predict, white-bg render, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
@@ -61,10 +64,10 @@ if st.button("Predict", type="primary", width="stretch"):
     else:
         try:
             with st.spinner("Featurizing with Mordred and running the MLP…"):
-                # predict_safe runs in forked child(ren) so a malformed SMILES
+                # predict_safe runs in spawned child(ren) so a malformed SMILES
                 # that segfaults the C++ engine (SIGSEGV) can't take this server
                 # down -- a single bad input is reported as invalid instead.
-                pred, invalid = get_predictor().predict_safe(batch)
+                pred, invalid = predict_safe(_MODEL_DIR, batch)
         except Exception as e:  # never let a bad batch kill the whole app
             st.error(f"Could not process this batch: {e}")
             st.info("Check your SMILES for malformed entries and try again.")
@@ -120,10 +123,19 @@ if st.button("Predict", type="primary", width="stretch"):
             if good:
                 mols = [Chem.MolFromSmiles(s) for _, s in good]
                 leg = [f"{pred[i]:.0f} nm" for i, _ in good]
-                ncol, sub = 4, (260, 200)
+                # Size the grid to the actual molecule count (no empty cells)
+                # and give each cell a fixed white background so depictions are
+                # legible regardless of the Streamlit theme (a transparent
+                # background can read as an all-black cell on a dark theme).
+                ncol = min(4, len(mols))
+                sub = (260, 200)
                 nrow = (len(mols) + ncol - 1) // ncol
                 drawer = rdMolDraw2D.MolDraw2DSVG(ncol * sub[0], nrow * sub[1],
                                                  sub[0], sub[1])
+                opts = drawer.drawOptions()
+                opts.clearBackground = True
+                opts.backgroundColour = (1, 1, 1, 1)  # opaque white
+                drawer.SetDrawOptions(opts)
                 drawer.DrawMolecules(mols, legends=leg)
                 drawer.FinishDrawing()
                 # st.image renders an SVG string as a data-URI <img> (it matches

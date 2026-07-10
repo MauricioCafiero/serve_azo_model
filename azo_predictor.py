@@ -26,6 +26,17 @@ The three artifact files live next to this script:
 from __future__ import annotations
 
 import os
+
+# Single-thread the numeric backends BEFORE numpy/torch are imported. We force
+# (not setdefault) so a host that pre-sets OMP_NUM_THREADS -- e.g. Streamlit
+# Cloud's base image -- still runs single-threaded. A multithreaded OpenMP/MKL
+# runtime makes fork() unsafe: a child that segfaults can corrupt the parent's
+# OpenMP state and take the parent down too. With one thread there is no pool
+# to corrupt.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ[_v] = "1"
+
 import warnings
 import multiprocessing as mp
 from typing import List, Union
@@ -38,12 +49,6 @@ import torch.nn as nn
 # preprocessing imputes them, so silence the noise.
 warnings.filterwarnings("ignore", message=".*encountered in matmul.*",
                         category=RuntimeWarning)
-
-# Single CPU thread keeps Mordred's OpenMP backend from segfaulting on macOS
-# (see azo_model.py header). Set before the numeric stack is touched.
-for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-           "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_v, "1")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -202,25 +207,39 @@ class Featurizer:
 # --------------------------------------------------------------------------- #
 # Predictor -- ties featurizer + saved preprocessing stats + model together.
 # --------------------------------------------------------------------------- #
-def _isolated_predict_worker(predictor, smiles_list, conn):
-    """Run prediction in a forked child.
+def _isolated_predict_worker(model_dir, smiles_list, conn):
+    """Prediction in a *spawned* (fresh) child process.
 
     A malformed SMILES can segfault the C++ layer (RDKit parser or Mordred's
-    descriptor engine); that is a SIGSEGV, which Python try/except cannot
-    catch and which would take the parent (Streamlit server) down with it.
-    Running the work here, in a separate process, means a crash kills only
-    this child -- the parent detects the non-zero exit code and reports a
-    graceful error instead of dying. Single-thread the numeric backends to
-    keep the fork clean (no OpenMP thread pool to deadlock on).
+    descriptor engine); that is a SIGSEGV, which Python try/except cannot catch.
+    Running the work in a separate process means a crash kills only this child
+    -- the parent detects the non-zero exit code and reports a graceful error.
+
+    We use 'spawn' (not 'fork') so the child is a clean interpreter with no
+    inherited OpenMP/MKL/torch threads. Forking from a multithreaded parent is
+    unsafe: a segfaulting child can corrupt the parent's OpenMP runtime and
+    take the parent (the Streamlit server) down with it. The child builds its
+    own AZOPredictor from disk so nothing un-picklable (the torch model) has to
+    cross the process boundary.
     """
     try:
         torch.set_num_threads(1)
+        predictor = AZOPredictor(model_dir=model_dir)
         pred, invalid = predictor.predict(smiles_list)
         conn.send(("ok", pred, invalid))
     except Exception as e:  # any *Python* error surfaces as a friendly message
         conn.send(("err", f"{type(e).__name__}: {e}"))
     finally:
         conn.close()
+
+
+def _get_spawn_ctx():
+    # 'spawn' is the safe choice on Linux/macOS; fall back to the platform
+    # default if it is somehow unavailable.
+    try:
+        return mp.get_context("spawn")
+    except ValueError:
+        return mp.get_context()
 
 
 class AZOPredictor:
@@ -312,81 +331,72 @@ class AZOPredictor:
             preds[valid_mask] = pv
         return preds, invalid_idx
 
-    def predict_isolated(self, smiles_list: Union[str, List[str]],
-                         timeout: float = 240.0):
-        """Like predict(), but in a forked child process.
 
-        A malformed SMILES can segfault the C++ engine (SIGSEGV), which Python
-        cannot catch and which would kill the host process. This runs the
-        prediction in a child so a crash is contained: on a segfault or hang we
-        raise a RuntimeError with a friendly message for the caller to show,
-        rather than taking the whole process down.
+def predict_isolated(model_dir, smiles_list, timeout: float = 240.0):
+    """Run prediction for a batch in a spawned child process.
 
-        Uses the 'fork' start method where available so the already-loaded
-        model is inherited by the child for free (no reload); falls back to
-        the platform default otherwise.
-        """
-        if isinstance(smiles_list, str):
-            smiles_list = [smiles_list]
-        try:
-            ctx = mp.get_context("fork")
-        except ValueError:
-            ctx = mp.get_context()
+    A malformed SMILES can segfault the C++ engine (SIGSEGV), which Python
+    cannot catch and which would kill the host process. This runs the work in a
+    spawned child so a crash is contained: on a segfault or hang we raise a
+    RuntimeError with a friendly message, rather than taking the process down.
+    """
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+    ctx = _get_spawn_ctx()
 
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        proc = ctx.Process(target=_isolated_predict_worker,
-                           args=(self, smiles_list, child_conn), daemon=True)
-        proc.start()
-        child_conn.close()  # parent only reads
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_isolated_predict_worker,
+                       args=(model_dir, smiles_list, child_conn), daemon=True)
+    proc.start()
+    child_conn.close()  # parent only reads
 
-        proc.join(timeout)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(5)
-            raise RuntimeError(
-                "Prediction timed out — a SMILES may have hung the RDKit/Mordred "
-                "engine. Please remove it and try again.")
-        if proc.exitcode in (None, 0):
-            # exitcode 0 -> child ran; read its message. None should not happen
-            # after join, but guard anyway.
-            if not parent_conn.poll():
-                raise RuntimeError(
-                    "Prediction produced no output — please try again.")
-            tag, *rest = parent_conn.recv()
-            if tag == "ok":
-                return rest[0], rest[1]
-            raise RuntimeError(rest[0])
-        # Non-zero exit code -> child was killed by a signal (e.g. -11 SIGSEGV).
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
         raise RuntimeError(
-            "Prediction crashed — a malformed SMILES tripped the RDKit/Mordred "
-            "C++ engine (segmentation fault). Please fix or remove it and try "
-            "again.")
+            "Prediction timed out — a SMILES may have hung the RDKit/Mordred "
+            "engine. Please remove it and try again.")
+    if proc.exitcode in (None, 0):
+        if not parent_conn.poll():
+            raise RuntimeError("Prediction produced no output — please try again.")
+        tag, *rest = parent_conn.recv()
+        if tag == "ok":
+            return rest[0], rest[1]
+        raise RuntimeError(rest[0])
+    # Non-zero exit code -> child was killed by a signal (e.g. -11 SIGSEGV).
+    raise RuntimeError(
+        "Prediction crashed — a malformed SMILES tripped the RDKit/Mordred "
+        "C++ engine (segmentation fault). Please fix or remove it and try "
+        "again.")
 
-    def predict_safe(self, smiles_list: Union[str, List[str]],
-                     timeout: float = 240.0, per_item_timeout: float = 60.0):
-        """Resilient prediction for untrusted input (the Streamlit entry point).
 
-        Tries the whole batch in one isolated child first (fast path). If that
-        crashes or times out -- which means at least one SMILES is pathological
-        -- falls back to running each SMILES in its own isolated child, so a
-        single bad input is reported as invalid instead of costing the
-        predictions for the whole batch. Returns (preds, invalid_idx) where
-        invalid_idx covers both parse failures and per-molecule crashes.
-        """
-        if isinstance(smiles_list, str):
-            smiles_list = [smiles_list]
-        try:
-            return self.predict_isolated(smiles_list, timeout=timeout)
-        except RuntimeError:
-            preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
-            invalid = []
-            for i, smi in enumerate(smiles_list):
-                try:
-                    pv, _ = self.predict_isolated([smi], timeout=per_item_timeout)
-                    preds[i] = pv[0]
-                except RuntimeError:
-                    invalid.append(i)
-            return preds, invalid
+def predict_safe(model_dir, smiles_list, timeout: float = 240.0,
+                 per_item_timeout: float = 60.0):
+    """Resilient prediction for untrusted input (the Streamlit entry point).
+
+    Tries the whole batch in one spawned child first (fast path). If that
+    crashes or times out -- meaning at least one SMILES is pathological --
+    falls back to running each SMILES in its own spawned child, so a single bad
+    input is reported as invalid instead of costing the predictions for the
+    whole batch. Returns (preds, invalid_idx) where invalid_idx covers both
+    parse failures and per-molecule crashes.
+    """
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+    try:
+        return predict_isolated(model_dir, smiles_list, timeout=timeout)
+    except RuntimeError:
+        preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
+        invalid = []
+        for i, smi in enumerate(smiles_list):
+            try:
+                pv, _ = predict_isolated(model_dir, [smi],
+                                         timeout=per_item_timeout)
+                preds[i] = pv[0]
+            except RuntimeError:
+                invalid.append(i)
+        return preds, invalid
 
 
 if __name__ == "__main__":
