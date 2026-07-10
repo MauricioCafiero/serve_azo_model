@@ -21,16 +21,71 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import numpy as np
 import streamlit as st
 
-from azo_predictor import predict_safe, render_smiles_svg
-
 st.set_page_config(page_title="AZO lambda_max predictor", page_icon="🧪",
                    layout="centered")
 
-# The model + Mordred featurizer load in the spawned prediction child, not
-# here -- the parent (this Streamlit process) never touches the C++ engine, so
-# a segfault in a child can't take the server down. We only need the path to
-# the artifacts.
+# Prediction and rendering run in a fresh subprocess (azo_worker.py), not in
+# this process and not via multiprocessing -- so the RDKit/Mordred C++ engine
+# is never loaded here and a segfault there can't take the Streamlit server
+# down. The parent only needs the path to the artifacts and the worker script.
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORKER = os.path.join(_MODEL_DIR, "azo_worker.py")
+
+
+def _call_worker(payload, timeout):
+    """Run azo_worker.py with a JSON request, return its JSON response.
+    Raises RuntimeError on crash/timeout so callers can fall back gracefully."""
+    import json
+    import subprocess
+    import sys
+    try:
+        proc = subprocess.run(
+            [sys.executable, _WORKER],
+            input=json.dumps(payload), capture_output=True, text=True,
+            cwd=_MODEL_DIR, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("timed out")
+    if proc.returncode != 0:
+        raise RuntimeError(f"crashed (exit {proc.returncode})")
+    try:
+        return json.loads(proc.stdout)
+    except Exception:
+        raise RuntimeError("no output")
+
+
+def predict_safe(model_dir, smiles_list, timeout=240.0, per_item_timeout=60.0):
+    """Predict lambda_max via a subprocess worker. On a whole-batch crash,
+    fall back to one worker per SMILES so a single bad input is reported
+    invalid instead of costing the batch."""
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+    try:
+        r = _call_worker({"mode": "predict", "model_dir": model_dir,
+                          "smiles": smiles_list}, timeout)
+        return np.array(r["pred"], dtype=np.float64), list(r["invalid"])
+    except RuntimeError:
+        preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
+        invalid = []
+        for i, smi in enumerate(smiles_list):
+            try:
+                r = _call_worker({"mode": "predict", "model_dir": model_dir,
+                                  "smiles": [smi]}, per_item_timeout)
+                preds[i] = r["pred"][0]
+            except RuntimeError:
+                invalid.append(i)
+        return preds, invalid
+
+
+def render_smiles_svg(items, timeout=120.0):
+    """Render molecules to one SVG string via a subprocess worker. Returns ''
+    on crash/timeout/parse-failure so the UI shows a graceful fallback."""
+    if not items:
+        return ""
+    try:
+        r = _call_worker({"mode": "render", "items": items}, timeout)
+        return r.get("svg", "")
+    except RuntimeError:
+        return ""
 
 
 st.title("AZO dye λmax predictor")
@@ -42,7 +97,7 @@ st.caption(
 
 # Build marker -- bump with every deploy so the live page shows which code is
 # running.
-_BUILD = "build-9 (single-thread env forced before numpy import, 2026-07-10)"
+_BUILD = "build-10 (subprocess isolation, no multiprocessing, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(

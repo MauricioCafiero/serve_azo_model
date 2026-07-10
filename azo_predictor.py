@@ -38,7 +38,6 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
     os.environ[_v] = "1"
 
 import warnings
-import multiprocessing as mp
 from typing import List, Union
 
 import numpy as np
@@ -207,45 +206,12 @@ class Featurizer:
 # --------------------------------------------------------------------------- #
 # Predictor -- ties featurizer + saved preprocessing stats + model together.
 # --------------------------------------------------------------------------- #
-def _isolated_predict_worker(model_dir, smiles_list, conn):
-    """Prediction in a *spawned* (fresh) child process.
-
-    A malformed SMILES can segfault the C++ layer (RDKit parser or Mordred's
-    descriptor engine); that is a SIGSEGV, which Python try/except cannot catch.
-    Running the work in a separate process means a crash kills only this child
-    -- the parent detects the non-zero exit code and reports a graceful error.
-
-    We use 'spawn' (not 'fork') so the child is a clean interpreter with no
-    inherited OpenMP/MKL/torch threads. Forking from a multithreaded parent is
-    unsafe: a segfaulting child can corrupt the parent's OpenMP runtime and
-    take the parent (the Streamlit server) down with it. The child builds its
-    own AZOPredictor from disk so nothing un-picklable (the torch model) has to
-    cross the process boundary.
-    """
-    try:
-        torch.set_num_threads(1)
-        predictor = AZOPredictor(model_dir=model_dir)
-        pred, invalid = predictor.predict(smiles_list)
-        conn.send(("ok", pred, invalid))
-    except Exception as e:  # any *Python* error surfaces as a friendly message
-        conn.send(("err", f"{type(e).__name__}: {e}"))
-    finally:
-        conn.close()
-
-
-def _get_spawn_ctx():
-    # 'spawn' is the safe choice on Linux/macOS; fall back to the platform
-    # default if it is somehow unavailable.
-    try:
-        return mp.get_context("spawn")
-    except ValueError:
-        return mp.get_context()
-
-
 class AZOPredictor:
-    def __init__(self, model_dir: str = _HERE, device: str = "cpu"):
+    def __init__(self, model_dir: str = _HERE, device: str = "cpu",
+                 n_jobs: int = -1):
         self.device = torch.device(device)
         self.model_dir = model_dir
+        self.n_jobs = n_jobs
         self._load_params()
         self._load_prep_stats()
         self._load_model()
@@ -284,7 +250,7 @@ class AZOPredictor:
     @property
     def featurizer(self):
         if self._featurizer is None:
-            self._featurizer = Featurizer()
+            self._featurizer = Featurizer(n_jobs=self.n_jobs)
         return self._featurizer
 
     # -- preprocessing (exact replay of pytorch_mlp.predict_single_value) --
@@ -330,137 +296,6 @@ class AZOPredictor:
                 pv = self.model(t).detach().cpu().numpy().reshape(-1)
             preds[valid_mask] = pv
         return preds, invalid_idx
-
-
-def predict_isolated(model_dir, smiles_list, timeout: float = 240.0):
-    """Run prediction for a batch in a spawned child process.
-
-    A malformed SMILES can segfault the C++ engine (SIGSEGV), which Python
-    cannot catch and which would kill the host process. This runs the work in a
-    spawned child so a crash is contained: on a segfault or hang we raise a
-    RuntimeError with a friendly message, rather than taking the process down.
-    """
-    if isinstance(smiles_list, str):
-        smiles_list = [smiles_list]
-    ctx = _get_spawn_ctx()
-
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=_isolated_predict_worker,
-                       args=(model_dir, smiles_list, child_conn), daemon=True)
-    proc.start()
-    child_conn.close()  # parent only reads
-
-    proc.join(timeout)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5)
-        raise RuntimeError(
-            "Prediction timed out — a SMILES may have hung the RDKit/Mordred "
-            "engine. Please remove it and try again.")
-    if proc.exitcode in (None, 0):
-        if not parent_conn.poll():
-            raise RuntimeError("Prediction produced no output — please try again.")
-        tag, *rest = parent_conn.recv()
-        if tag == "ok":
-            return rest[0], rest[1]
-        raise RuntimeError(rest[0])
-    # Non-zero exit code -> child was killed by a signal (e.g. -11 SIGSEGV).
-    raise RuntimeError(
-        "Prediction crashed — a malformed SMILES tripped the RDKit/Mordred "
-        "C++ engine (segmentation fault). Please fix or remove it and try "
-        "again.")
-
-
-def predict_safe(model_dir, smiles_list, timeout: float = 240.0,
-                 per_item_timeout: float = 60.0):
-    """Resilient prediction for untrusted input (the Streamlit entry point).
-
-    Tries the whole batch in one spawned child first (fast path). If that
-    crashes or times out -- meaning at least one SMILES is pathological --
-    falls back to running each SMILES in its own spawned child, so a single bad
-    input is reported as invalid instead of costing the predictions for the
-    whole batch. Returns (preds, invalid_idx) where invalid_idx covers both
-    parse failures and per-molecule crashes.
-    """
-    if isinstance(smiles_list, str):
-        smiles_list = [smiles_list]
-    try:
-        return predict_isolated(model_dir, smiles_list, timeout=timeout)
-    except RuntimeError:
-        preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
-        invalid = []
-        for i, smi in enumerate(smiles_list):
-            try:
-                pv, _ = predict_isolated(model_dir, [smi],
-                                         timeout=per_item_timeout)
-                preds[i] = pv[0]
-            except RuntimeError:
-                invalid.append(i)
-        return preds, invalid
-
-
-# --------------------------------------------------------------------------- #
-# Structure rendering -- also run in a spawned child, for the same reason as
-# prediction: RDKit's 2D drawer is C++ and can segfault on certain inputs /
-# builds, and that must not take the Streamlit server down. The parent never
-# imports or calls RDKit; it just displays the SVG string this returns.
-# --------------------------------------------------------------------------- #
-def _render_worker(smiles_legends, conn):
-    """Draw a grid of molecules to an SVG string. Runs in a spawned child."""
-    try:
-        from rdkit import Chem
-        from rdkit.Chem.Draw import rdMolDraw2D
-        mols, leg = [], []
-        for smi, legend in smiles_legends:
-            m = Chem.MolFromSmiles(smi)
-            if m is None:
-                continue
-            mols.append(m)
-            leg.append(legend)
-        if not mols:
-            conn.send(("ok", ""))
-            return
-        ncol = min(4, len(mols))
-        sub = (260, 200)
-        nrow = (len(mols) + ncol - 1) // ncol
-        drawer = rdMolDraw2D.MolDraw2DSVG(ncol * sub[0], nrow * sub[1],
-                                         sub[0], sub[1])
-        opts = drawer.drawOptions()
-        opts.clearBackground = True
-        opts.backgroundColour = (1, 1, 1, 1)  # opaque white, any theme
-        drawer.SetDrawOptions(opts)
-        drawer.DrawMolecules(mols, legends=leg)
-        drawer.FinishDrawing()
-        conn.send(("ok", drawer.GetDrawingText()))
-    except Exception as e:
-        conn.send(("err", f"{type(e).__name__}: {e}"))
-    finally:
-        conn.close()
-
-
-def render_smiles_svg(smiles_legends, timeout: float = 120.0):
-    """Render a list of (smiles, legend) to a single SVG string in a spawned
-    child. Returns "" on crash/timeout/parse-failure so the caller can show a
-    graceful fallback instead of dying."""
-    if not smiles_legends:
-        return ""
-    ctx = _get_spawn_ctx()
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=_render_worker, args=(smiles_legends, child_conn),
-                       daemon=True)
-    proc.start()
-    child_conn.close()
-    proc.join(timeout)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5)
-        return ""
-    if proc.exitcode not in (None, 0):
-        return ""  # child killed by a signal (segfault) -- contained
-    if not parent_conn.poll():
-        return ""
-    tag, *rest = parent_conn.recv()
-    return rest[0] if tag == "ok" else ""
 
 
 if __name__ == "__main__":
