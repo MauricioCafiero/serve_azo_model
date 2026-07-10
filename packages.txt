@@ -1,0 +1,8 @@
+# Streamlit Community Cloud apt-installs each line at deploy time.
+# RDKit's 2D drawing C++ extension (rdMolDraw2D) is linked against libcairo,
+# which in turn needs libXrender/libXext/libSM. Without these, importing the
+# drawer fails with: libXrender.so.1: cannot open shared object file.
+libxrender1
+libxext6
+libsm6
+libcairo2
