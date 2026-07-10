@@ -30,7 +30,7 @@ st.caption(
 
 # Build marker -- bump this string with every deploy so you can confirm (from
 # the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-5 (svg-render + graceful SMILES errors, 2026-07-10)"
+_BUILD = "build-6 (segfault-isolated predict, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
@@ -61,12 +61,13 @@ if st.button("Predict", type="primary", width="stretch"):
     else:
         try:
             with st.spinner("Featurizing with Mordred and running the MLP…"):
-                pred, invalid = get_predictor().predict(batch)
+                # predict_safe runs in forked child(ren) so a malformed SMILES
+                # that segfaults the C++ engine (SIGSEGV) can't take this server
+                # down -- a single bad input is reported as invalid instead.
+                pred, invalid = get_predictor().predict_safe(batch)
         except Exception as e:  # never let a bad batch kill the whole app
-            st.error(
-                "Something went wrong while processing this batch. Check your "
-                "SMILES for typos and try again."
-            )
+            st.error(f"Could not process this batch: {e}")
+            st.info("Check your SMILES for malformed entries and try again.")
             with st.expander("Error details"):
                 st.code(f"{type(e).__name__}: {e}")
             st.stop()

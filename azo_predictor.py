@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import warnings
+import multiprocessing as mp
 from typing import List, Union
 
 import numpy as np
@@ -201,6 +202,27 @@ class Featurizer:
 # --------------------------------------------------------------------------- #
 # Predictor -- ties featurizer + saved preprocessing stats + model together.
 # --------------------------------------------------------------------------- #
+def _isolated_predict_worker(predictor, smiles_list, conn):
+    """Run prediction in a forked child.
+
+    A malformed SMILES can segfault the C++ layer (RDKit parser or Mordred's
+    descriptor engine); that is a SIGSEGV, which Python try/except cannot
+    catch and which would take the parent (Streamlit server) down with it.
+    Running the work here, in a separate process, means a crash kills only
+    this child -- the parent detects the non-zero exit code and reports a
+    graceful error instead of dying. Single-thread the numeric backends to
+    keep the fork clean (no OpenMP thread pool to deadlock on).
+    """
+    try:
+        torch.set_num_threads(1)
+        pred, invalid = predictor.predict(smiles_list)
+        conn.send(("ok", pred, invalid))
+    except Exception as e:  # any *Python* error surfaces as a friendly message
+        conn.send(("err", f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
 class AZOPredictor:
     def __init__(self, model_dir: str = _HERE, device: str = "cpu"):
         self.device = torch.device(device)
@@ -289,6 +311,82 @@ class AZOPredictor:
                 pv = self.model(t).detach().cpu().numpy().reshape(-1)
             preds[valid_mask] = pv
         return preds, invalid_idx
+
+    def predict_isolated(self, smiles_list: Union[str, List[str]],
+                         timeout: float = 240.0):
+        """Like predict(), but in a forked child process.
+
+        A malformed SMILES can segfault the C++ engine (SIGSEGV), which Python
+        cannot catch and which would kill the host process. This runs the
+        prediction in a child so a crash is contained: on a segfault or hang we
+        raise a RuntimeError with a friendly message for the caller to show,
+        rather than taking the whole process down.
+
+        Uses the 'fork' start method where available so the already-loaded
+        model is inherited by the child for free (no reload); falls back to
+        the platform default otherwise.
+        """
+        if isinstance(smiles_list, str):
+            smiles_list = [smiles_list]
+        try:
+            ctx = mp.get_context("fork")
+        except ValueError:
+            ctx = mp.get_context()
+
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(target=_isolated_predict_worker,
+                           args=(self, smiles_list, child_conn), daemon=True)
+        proc.start()
+        child_conn.close()  # parent only reads
+
+        proc.join(timeout)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            raise RuntimeError(
+                "Prediction timed out — a SMILES may have hung the RDKit/Mordred "
+                "engine. Please remove it and try again.")
+        if proc.exitcode in (None, 0):
+            # exitcode 0 -> child ran; read its message. None should not happen
+            # after join, but guard anyway.
+            if not parent_conn.poll():
+                raise RuntimeError(
+                    "Prediction produced no output — please try again.")
+            tag, *rest = parent_conn.recv()
+            if tag == "ok":
+                return rest[0], rest[1]
+            raise RuntimeError(rest[0])
+        # Non-zero exit code -> child was killed by a signal (e.g. -11 SIGSEGV).
+        raise RuntimeError(
+            "Prediction crashed — a malformed SMILES tripped the RDKit/Mordred "
+            "C++ engine (segmentation fault). Please fix or remove it and try "
+            "again.")
+
+    def predict_safe(self, smiles_list: Union[str, List[str]],
+                     timeout: float = 240.0, per_item_timeout: float = 60.0):
+        """Resilient prediction for untrusted input (the Streamlit entry point).
+
+        Tries the whole batch in one isolated child first (fast path). If that
+        crashes or times out -- which means at least one SMILES is pathological
+        -- falls back to running each SMILES in its own isolated child, so a
+        single bad input is reported as invalid instead of costing the
+        predictions for the whole batch. Returns (preds, invalid_idx) where
+        invalid_idx covers both parse failures and per-molecule crashes.
+        """
+        if isinstance(smiles_list, str):
+            smiles_list = [smiles_list]
+        try:
+            return self.predict_isolated(smiles_list, timeout=timeout)
+        except RuntimeError:
+            preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
+            invalid = []
+            for i, smi in enumerate(smiles_list):
+                try:
+                    pv, _ = self.predict_isolated([smi], timeout=per_item_timeout)
+                    preds[i] = pv[0]
+                except RuntimeError:
+                    invalid.append(i)
+            return preds, invalid
 
 
 if __name__ == "__main__":
