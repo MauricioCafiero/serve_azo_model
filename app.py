@@ -28,6 +28,11 @@ st.caption(
     "performance on 18 new azo dyes: **MAE ≈ 27 nm, R² ≈ 0.69**."
 )
 
+# Build marker -- bump this string with every deploy so you can confirm (from
+# the live page) that Streamlit Cloud is actually running the latest code.
+_BUILD = "build-2 (svg-render + graceful SMILES errors, 2026-07-10)"
+st.caption(f"`{_BUILD}`")
+
 st.markdown(
     "**Caveat:** the model was trained on a fixed azo-dye chemical space. "
     "Predictions are unreliable far outside it (e.g. non-azo scaffolds, very "
