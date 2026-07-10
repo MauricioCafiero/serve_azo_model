@@ -30,7 +30,7 @@ st.caption(
 
 # Build marker -- bump this string with every deploy so you can confirm (from
 # the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-4 (svg-render + graceful SMILES errors, 2026-07-10)"
+_BUILD = "build-5 (svg-render + graceful SMILES errors, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
@@ -55,7 +55,7 @@ with st.expander("Optional: paste known λmax (nm) values to compare (one per li
                             key="truth")
 truths = [t.strip() for t in truth_in.splitlines() if t.strip()] if truth_in else []
 
-if st.button("Predict", type="primary", use_container_width=True):
+if st.button("Predict", type="primary", width="stretch"):
     if not batch:
         st.warning("Enter at least one SMILES.")
     else:
@@ -93,7 +93,7 @@ if st.button("Predict", type="primary", use_container_width=True):
                     except ValueError:
                         row["Known λmax (nm)"] = truths[i]
             rows.append(row)
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
         # Summary when every (valid) prediction has a reference value
         valid_idx = [i for i in range(len(batch)) if i not in invalid_set]
@@ -125,9 +125,11 @@ if st.button("Predict", type="primary", use_container_width=True):
                                                  sub[0], sub[1])
                 drawer.DrawMolecules(mols, legends=leg)
                 drawer.FinishDrawing()
-                svg = drawer.GetDrawingText()
-                svg = svg[svg.find("<svg"):]  # drop <?xml?> prolog
+                # st.image renders an SVG string as a data-URI <img> (it matches
+                # the leading <?xml?>/<svg> and base64-encodes it). Pass the raw
+                # string -- bytes/BytesIO would go through PIL, which can't parse
+                # SVG. width="stretch" is the recommended sizing for SVGs.
                 st.subheader("Structures")
-                st.markdown(svg, unsafe_allow_html=True)
+                st.image(drawer.GetDrawingText(), width="stretch")
         except Exception as e:  # rendering is cosmetic; never block on it
             st.info(f"(Molecule rendering unavailable: {e})")
