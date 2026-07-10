@@ -399,6 +399,70 @@ def predict_safe(model_dir, smiles_list, timeout: float = 240.0,
         return preds, invalid
 
 
+# --------------------------------------------------------------------------- #
+# Structure rendering -- also run in a spawned child, for the same reason as
+# prediction: RDKit's 2D drawer is C++ and can segfault on certain inputs /
+# builds, and that must not take the Streamlit server down. The parent never
+# imports or calls RDKit; it just displays the SVG string this returns.
+# --------------------------------------------------------------------------- #
+def _render_worker(smiles_legends, conn):
+    """Draw a grid of molecules to an SVG string. Runs in a spawned child."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem.Draw import rdMolDraw2D
+        mols, leg = [], []
+        for smi, legend in smiles_legends:
+            m = Chem.MolFromSmiles(smi)
+            if m is None:
+                continue
+            mols.append(m)
+            leg.append(legend)
+        if not mols:
+            conn.send(("ok", ""))
+            return
+        ncol = min(4, len(mols))
+        sub = (260, 200)
+        nrow = (len(mols) + ncol - 1) // ncol
+        drawer = rdMolDraw2D.MolDraw2DSVG(ncol * sub[0], nrow * sub[1],
+                                         sub[0], sub[1])
+        opts = drawer.drawOptions()
+        opts.clearBackground = True
+        opts.backgroundColour = (1, 1, 1, 1)  # opaque white, any theme
+        drawer.SetDrawOptions(opts)
+        drawer.DrawMolecules(mols, legends=leg)
+        drawer.FinishDrawing()
+        conn.send(("ok", drawer.GetDrawingText()))
+    except Exception as e:
+        conn.send(("err", f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
+def render_smiles_svg(smiles_legends, timeout: float = 120.0):
+    """Render a list of (smiles, legend) to a single SVG string in a spawned
+    child. Returns "" on crash/timeout/parse-failure so the caller can show a
+    graceful fallback instead of dying."""
+    if not smiles_legends:
+        return ""
+    ctx = _get_spawn_ctx()
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_render_worker, args=(smiles_legends, child_conn),
+                       daemon=True)
+    proc.start()
+    child_conn.close()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        return ""
+    if proc.exitcode not in (None, 0):
+        return ""  # child killed by a signal (segfault) -- contained
+    if not parent_conn.poll():
+        return ""
+    tag, *rest = parent_conn.recv()
+    return rest[0] if tag == "ok" else ""
+
+
 if __name__ == "__main__":
     # Quick CLI sanity check: print predictions for any SMILES passed as args.
     import sys

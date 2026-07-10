@@ -12,7 +12,7 @@ import os
 import numpy as np
 import streamlit as st
 
-from azo_predictor import predict_safe
+from azo_predictor import predict_safe, render_smiles_svg
 
 st.set_page_config(page_title="AZO lambda_max predictor", page_icon="🧪",
                    layout="centered")
@@ -33,7 +33,7 @@ st.caption(
 
 # Build marker -- bump this string with every deploy so you can confirm (from
 # the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-7 (spawn-isolated predict, white-bg render, 2026-07-10)"
+_BUILD = "build-8 (predict + render both spawn-isolated, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
@@ -111,38 +111,17 @@ if st.button("Predict", type="primary", width="stretch"):
             c1.metric("MAE (nm)", f"{mae:.2f}")
             c2.metric("R²", f"{r2:.3f}")
 
-        # Draw the molecules (lightweight RDKit rendering, no 3D needed).
-        # Use the SVG drawer rather than Draw.MolsToGridImage: the PNG/cairo
-        # path pulls in libXrender (libXrender.so.1), which is missing on
-        # Streamlit Cloud, so images silently fail there. MolDraw2DSVG is
-        # pure-Python and renders identically.
-        try:
-            from rdkit import Chem
-            from rdkit.Chem.Draw import rdMolDraw2D
-            good = [(i, batch[i]) for i in valid_idx]
-            if good:
-                mols = [Chem.MolFromSmiles(s) for _, s in good]
-                leg = [f"{pred[i]:.0f} nm" for i, _ in good]
-                # Size the grid to the actual molecule count (no empty cells)
-                # and give each cell a fixed white background so depictions are
-                # legible regardless of the Streamlit theme (a transparent
-                # background can read as an all-black cell on a dark theme).
-                ncol = min(4, len(mols))
-                sub = (260, 200)
-                nrow = (len(mols) + ncol - 1) // ncol
-                drawer = rdMolDraw2D.MolDraw2DSVG(ncol * sub[0], nrow * sub[1],
-                                                 sub[0], sub[1])
-                opts = drawer.drawOptions()
-                opts.clearBackground = True
-                opts.backgroundColour = (1, 1, 1, 1)  # opaque white
-                drawer.SetDrawOptions(opts)
-                drawer.DrawMolecules(mols, legends=leg)
-                drawer.FinishDrawing()
-                # st.image renders an SVG string as a data-URI <img> (it matches
-                # the leading <?xml?>/<svg> and base64-encodes it). Pass the raw
-                # string -- bytes/BytesIO would go through PIL, which can't parse
-                # SVG. width="stretch" is the recommended sizing for SVGs.
-                st.subheader("Structures")
-                st.image(drawer.GetDrawingText(), width="stretch")
-        except Exception as e:  # rendering is cosmetic; never block on it
-            st.info(f"(Molecule rendering unavailable: {e})")
+        # Draw the molecules. Rendering also runs in a spawned child (see
+        # render_smiles_svg): RDKit's 2D drawer is C++ and can segfault on
+        # certain inputs/builds, and that must not take this server down. The
+        # parent never imports or calls RDKit -- it just displays the SVG.
+        smi_leg = [(batch[i], f"{pred[i]:.0f} nm") for i in valid_idx]
+        svg = render_smiles_svg(smi_leg)
+        st.subheader("Structures")
+        if svg:
+            # st.image renders an SVG string as a data-URI <img> (it matches
+            # the leading <?xml?>/<svg> and base64-encodes it). width="stretch"
+            # is the recommended sizing for SVGs.
+            st.image(svg, width="stretch")
+        else:
+            st.info("(Molecule rendering unavailable for this batch.)")
