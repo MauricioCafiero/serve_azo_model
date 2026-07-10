@@ -30,7 +30,7 @@ st.caption(
 
 # Build marker -- bump this string with every deploy so you can confirm (from
 # the live page) that Streamlit Cloud is actually running the latest code.
-_BUILD = "build-3 (svg-render + graceful SMILES errors, 2026-07-10)"
+_BUILD = "build-4 (svg-render + graceful SMILES errors, 2026-07-10)"
 st.caption(f"`{_BUILD}`")
 
 st.markdown(
